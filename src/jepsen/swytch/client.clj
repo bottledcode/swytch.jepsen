@@ -31,8 +31,8 @@
           (assoc ~op :type :info :error (.getMessage e#)))
         (catch IOException e#
           (assoc ~op :type :info :error (.getMessage e#)))
-        (catch Exception e#
-          (assoc ~op :type :info :error (.getMessage e#)))))
+        (catch java.util.concurrent.TimeoutException e#
+          (assoc ~op :type :info :error :timeout))))
 
 (defrecord SwytchClient [conn node]
   client/Client
@@ -77,7 +77,6 @@
         :txn     (let [txn-ops (:value op)
                        results
                        (car/wcar conn
-                         ;; WATCH keys involved in the txn
                          (let [keys (distinct (map (comp str :key) txn-ops))]
                            (doseq [k keys] (car/watch k)))
                          (car/multi)
@@ -86,11 +85,21 @@
                              :read  (car/get (str key))
                              :write (car/set (str key) (str value))
                              :incr  (car/incr (str key))))
-                         (car/exec))]
-                   (if (nil? results)
-                     ;; EXEC returned nil → WATCH detected conflict
+                         (car/exec))
+                       exec-result (last results)]
+                   (cond
+                     (nil? exec-result)
                      (assoc op :type :fail :error :watch-conflict)
-                     (assoc op :type :ok :value results))))))
+
+                     (some #(instance? Exception %) exec-result)
+                     (assoc op :type :fail
+                               :error (mapv #(if (instance? Exception %)
+                                               (.getMessage %)
+                                               %)
+                                            exec-result))
+
+                     :else
+                     (assoc op :type :ok :value exec-result))))))
 
   (teardown! [this test])
 
