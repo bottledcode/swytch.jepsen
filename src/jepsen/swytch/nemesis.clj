@@ -41,9 +41,15 @@
   [test]
   (let [nodes   (rand/shuffle (:nodes test))
         n       (count nodes)
-        ;; Split into thirds: A gets 1/3, B gets 1/3, C gets the rest
+        _       (when (< n 3)
+                  (throw (ex-info "Asymmetric partition requires at least 3 nodes"
+                                  {:node-count n})))
+        ;; Split into thirds, ensuring each group has at least 1 node
         a-size  (max 1 (quot n 3))
         b-size  (max 1 (quot n 3))
+        c-size  (- n a-size b-size)
+        ;; If c would be empty, shrink b to make room
+        b-size  (if (pos? c-size) b-size (max 1 (- n a-size 1)))
         a       (set (take a-size nodes))
         b       (set (take b-size (drop a-size nodes)))
         c       (set (drop (+ a-size b-size) nodes))]

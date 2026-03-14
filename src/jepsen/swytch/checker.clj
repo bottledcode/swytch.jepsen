@@ -300,7 +300,9 @@
                                     (store/path! test (:subdirectory checker-opts)
                                                  "elle" (str "node-" node))))
                            (vec ops))]))))]
-        {:valid?            (:valid? full-result)
+        {:valid?            (checker/merge-valid
+                              (cons (:valid? full-result)
+                                    (map :valid? (vals partition-results))))
          :full              full-result
          :per-partition     partition-results}))))
 
