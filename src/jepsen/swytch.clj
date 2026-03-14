@@ -10,48 +10,8 @@
                     [tests :as tests]]
             [jepsen.checker.timeline :as timeline]
             [jepsen.os.debian :as debian]
-            [jepsen.swytch.db :as sdb]
-            [taoensso.carmine :as car]))
-
-;; ---- Redis client via Carmine ----
-
-(defn conn-spec
-  "Returns a Carmine connection spec for the given node."
-  [node]
-  {:pool {}
-   :spec {:host node
-          :port sdb/redis-port}})
-
-(defn redis-get [conn key]
-  (car/wcar conn (car/get key)))
-
-(defn redis-set [conn key value]
-  (car/wcar conn (car/set key value)))
-
-;; ---- Jepsen Client ----
-
-(defrecord SwytchClient [conn node]
-  client/Client
-  (open! [this test node]
-    (assoc this
-           :conn (conn-spec node)
-           :node node))
-
-  (setup! [this test])
-
-  (invoke! [this test op]
-    (try
-      (case (:f op)
-        :read  (let [v (redis-get conn (str (:key op)))]
-                 (assoc op :type :ok :value (when v (parse-long v))))
-        :write (do (redis-set conn (str (:key op)) (str (:value op)))
-                   (assoc op :type :ok)))
-      (catch Exception e
-        (assoc op :type :info :error (.getMessage e)))))
-
-  (teardown! [this test])
-
-  (close! [this test]))
+            [jepsen.swytch.client :as swytch-client]
+            [jepsen.swytch.db :as sdb]))
 
 ;; ---- Operation generators ----
 
@@ -74,7 +34,7 @@
             :ca-material    ca-material
             :noise-keys     noise-keys
             :cluster-config cluster-config
-            :client         (map->SwytchClient {})
+            :client         (swytch-client/client)
             :nemesis        nemesis/noop
             :checker        (checker/compose
                               {:timeline (timeline/html)})
