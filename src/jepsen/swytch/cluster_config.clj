@@ -1,9 +1,11 @@
 (ns jepsen.swytch.cluster-config
   "Generates Swytch cluster.yml from Jepsen's node topology.
 
-  Nodes are split into two regions: the first half goes into region-a,
-  the remainder into region-b.  Each node gets a deterministic integer
-  ID via `node->id`."
+  Phase 1: all nodes are in a single region (\"local\"). This models
+  the free-tier nearcache deployment where cluster membership is fully
+  known and the consistency model is flat majority-reachability.
+
+  Each node gets a deterministic integer ID via `node->id`."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info]]
             [jepsen [control :as c]]))
@@ -19,13 +21,10 @@
     (inc (.indexOf (vec sorted) node))))
 
 (defn node-region
-  "Assigns a node to one of two regions based on its position.
-  First ceil(n/2) nodes go to region-a, rest to region-b."
-  [test node]
-  (let [sorted   (sort (:nodes test))
-        idx      (.indexOf (vec sorted) node)
-        midpoint (int (Math/ceil (/ (count sorted) 2.0)))]
-    (if (< idx midpoint) "region-a" "region-b")))
+  "Returns the region for a node. In Phase 1 (single-region / nearcache),
+  all nodes belong to the same region."
+  [_test _node]
+  "local")
 
 (defn noise-public-key
   "Derives the Noise protocol public key from a node's TLS cert.
@@ -34,8 +33,8 @@
   (let [cert-path (str "/etc/swytch/certs/" node "-cert.pem")
         key-path  (str "/etc/swytch/certs/" node "-key.pem")]
     (str/trim (c/exec "/opt/swytch/noise-keygen"
-                      "-cert" cert-path
-                      "-key"  key-path))))
+                      cert-path
+                      key-path))))
 
 (defn gen-cluster-config
   "Generates the cluster.yml content string for the given test.

@@ -7,8 +7,6 @@
   :dependencies [[org.clojure/clojure "1.12.4"]
                  [jepsen "0.3.11-SNAPSHOT"]
                  [io.jepsen/generator "0.1.1"]
-                 [jepsen.txn "0.1.3"]
-                 [elle "0.2.6"]
                  [com.taoensso/carmine "3.5.0"]]
   :jvm-opts ["-Xmx8g"
              "-Djava.awt.headless=true"
