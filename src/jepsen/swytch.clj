@@ -61,7 +61,7 @@
         fault-pkg       (:fault-pkg nemesis-pkg)
         ;; Compose nemeses from both packages into one.
         ;; nemesis/noop doesn't support Reflection (fs), so guard against that.
-        fs-or-empty (fn [nem] (try (nemesis/fs nem) (catch Exception _ #{})))
+        fs-or-empty (fn [nem] (try (nemesis/fs nem) (catch AbstractMethodError _ #{})))
         combined-nemesis (nemesis/compose
                            (merge {}
                              (when kill-pkg
@@ -92,7 +92,7 @@
             :generator      (sn/phase-generator
                               {:normal-secs (:normal-secs opts 10)
                                :fault-secs  (:fault-secs opts 30)
-                               :settle-secs (:settle-secs opts 10)}
+                               :settle-secs (:settle-secs opts 30)}
                               nemesis-pkg
                               (:generator workload)
                               (:final-generator workload))
@@ -114,16 +114,20 @@
     :default "safe"]
    [nil "--rate NUM" "Ops per second"
     :default 100
-    :parse-fn #(Long/parseLong %)]
+    :parse-fn #(Long/parseLong %)
+    :validate [pos? "Must be a positive number"]]
    [nil "--normal-secs NUM" "Seconds of normal operation before faults"
     :default 10
-    :parse-fn #(Long/parseLong %)]
+    :parse-fn #(Long/parseLong %)
+    :validate [pos? "Must be a positive number"]]
    [nil "--fault-secs NUM" "Seconds of fault injection"
     :default 30
-    :parse-fn #(Long/parseLong %)]
+    :parse-fn #(Long/parseLong %)
+    :validate [pos? "Must be a positive number"]]
    [nil "--settle-secs NUM" "Seconds to settle after healing (needs time for anti-entropy)"
     :default 30
-    :parse-fn #(Long/parseLong %)]
+    :parse-fn #(Long/parseLong %)
+    :validate [pos? "Must be a positive number"]]
    [nil "--debug" "Enable debug logging on Swytch nodes"
     :default false]])
 
