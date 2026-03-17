@@ -103,7 +103,7 @@
 (def cli-opts
   "Additional CLI options for Swytch tests."
   [[nil "--swytch-source PATH" "Path to Swytch source directory (builds automatically)"
-    :default "/home/withinboredom/code/cloxcache"]
+    :default "../cloxcache"]
    [nil "--swytch-binary PATH" "Path to a pre-built Swytch binary (skips build)"
     :default nil]
    [nil "--noise-keygen-binary PATH" "Path to a pre-built noise-keygen binary"
