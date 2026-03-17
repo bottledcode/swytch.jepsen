@@ -1,32 +1,25 @@
 (ns jepsen.swytch.nemesis
-  "Nemesis configurations for Swytch Jepsen tests. Leverages Jepsen's
-  built-in nemesis packages (partitions, kill/pause, clock, packet)
-  and adds Swytch-specific partition strategies (region-based split,
-  asymmetric partition).
+  "Nemesis configurations for Swytch Jepsen tests — Phase 1 (single-region).
 
-  Exposes two composed nemesis packages:
-    - `safe-nemesis`        — for safe-mode testing
-    - `holographic-nemesis` — for holographic-mode testing
+  Phase 1 models the free-tier nearcache: single region, in-memory,
+  no Swytch Cloud. The nemesis injects:
+    - Network partitions (majority split, single-node isolation)
+    - Single-node kill/restart (process crash + recovery)
+    - Clock skew (HLC absorption)
 
-  Both use phased scheduling: normal → fault → heal → settle → final-read."
-  (:require [clojure.set :as set]
-            [clojure.tools.logging :refer [info]]
+  Constraints from design.md:
+    - Do NOT kill a node while partitioned — it's a cache, not a
+      database, so data on that node is lost forever.
+    - Kill/restart runs ONLY during normal operation (before partitions).
+
+  Uses phased scheduling: normal → kill → settle → partition/clock → heal → settle → final-read."
+  (:require [clojure.tools.logging :refer [info]]
             [jepsen [generator :as gen]
                     [nemesis :as n]
-                    [net :as net]
                     [random :as rand]]
-            [jepsen.nemesis.combined :as nc]
-            [jepsen.swytch.cluster-config :as cc]))
+            [jepsen.nemesis.combined :as nc]))
 
 ;; ---- Custom partition grudges ----
-
-(defn region-grudge
-  "Splits nodes by their region assignment (region-a vs region-b).
-  Nodes in the same region can communicate; cross-region is blocked."
-  [test]
-  (let [nodes  (:nodes test)
-        groups (group-by #(cc/node-region test %) nodes)]
-    (n/complete-grudge (vals groups))))
 
 (defn island-grudge
   "Isolates every node from every other node — N partitions of 1."
@@ -60,11 +53,6 @@
 
 ;; ---- Custom partition specs for combined nemesis ----
 
-(defn region-partition-spec
-  "A partition spec that splits by Swytch region assignment."
-  [test _db]
-  (region-grudge test))
-
 (defn island-partition-spec
   "A partition spec that isolates every node."
   [test _db]
@@ -79,7 +67,7 @@
 
 (defn swytch-partition-nemesis
   "A partition nemesis that supports both standard Jepsen specs and
-  Swytch-specific ones (:region, :island, :asymmetric)."
+  Swytch-specific ones (:island, :asymmetric)."
   [db]
   (let [p (n/partitioner)]
     (reify
@@ -95,7 +83,6 @@
         (-> (case (:f op)
               :start-partition
               (let [grudge (case (:value op)
-                             :region    (region-grudge test)
                              :island    (island-grudge test)
                              :asymmetric (asymmetric-grudge test)
                              ;; Fall back to combined.clj's grudge for standard specs
@@ -113,8 +100,7 @@
   [opts]
   (let [needed?  ((:faults opts) :partition)
         targets  (:targets (:partition opts)
-                           [:one :majority :majorities-ring
-                            :region :island :asymmetric])
+                           [:one :majority :majorities-ring])
         start    (fn [_ _] {:type :info
                             :f :start-partition
                             :value (rand/nth targets)})
@@ -138,7 +124,6 @@
   (let [faults (set (:faults opts))
         opts   (assoc opts :faults faults)]
     [(swytch-partition-package opts)
-     (nc/packet-package opts)
      (nc/clock-package opts)
      (nc/db-package opts)]))
 
@@ -146,12 +131,10 @@
   "Composes all nemesis packages into one. Options:
 
     :db         The SwytchDB instance
-    :faults     Set of enabled faults, e.g. #{:partition :kill :pause :clock :packet}
+    :faults     Set of enabled faults, e.g. #{:partition :kill :clock}
     :interval   Seconds between nemesis operations (default 10)
     :partition  {:targets [...]}  — partition specs to use
-    :packet     {:targets [...] :behaviors [...]}
     :kill       {:targets [...]}
-    :pause      {:targets [...]}
     :clock      {:targets [...]}"
   [opts]
   (nc/compose-packages (swytch-nemesis-packages opts)))
@@ -161,70 +144,85 @@
 (defn phase-generator
   "Returns a generator that runs through phases:
     1. Normal operation (no faults) for `normal-secs`
-    2. Fault injection for `fault-secs`
-    3. Heal all faults
-    4. Settle for `settle-secs` (normal ops, no faults)
-    5. Final reads
+    2. Kill a random node + client ops for a brief window, then heal
+    3. Settle after kill for `settle-secs`
+    4. Fault injection (partitions, clock skew) for `fault-secs`
+    5. Heal all faults
+    6. Settle for `settle-secs` (normal ops, no faults)
+    7. Final reads
 
+  `kill-pkg` is a nemesis package for kill/restart (run before partitions).
+  `fault-pkg` is a nemesis package for partitions + clock skew.
   `client-gen` is the generator for client operations.
-  `nemesis-pkg` is a nemesis package from `nemesis-package`."
+  Either package may be nil to skip that phase."
   [{:keys [normal-secs fault-secs settle-secs]
     :or   {normal-secs 10
            fault-secs  30
            settle-secs 30}}
-   nemesis-pkg client-gen final-gen]
+   {:keys [kill-pkg fault-pkg]} client-gen final-gen]
   (gen/phases
     ;; Phase 1: normal operation
     (gen/clients
       (gen/time-limit normal-secs client-gen))
 
-    ;; Phase 2: faults + client ops
-    (->> client-gen
-         (gen/nemesis (:generator nemesis-pkg))
-         (gen/time-limit fault-secs))
+    ;; Phase 2: kill a node + client ops (before any partitions)
+    (when (:generator kill-pkg)
+      (->> client-gen
+           (gen/nemesis (:generator kill-pkg))
+           (gen/time-limit 10)))
 
-    ;; Phase 3: heal
-    (gen/nemesis (:final-generator nemesis-pkg))
+    ;; Phase 3: heal kills
+    (when (:final-generator kill-pkg)
+      (gen/nemesis (:final-generator kill-pkg)))
 
-    ;; Phase 4: settle with writes (normal operation after heal)
+    ;; Phase 4: settle after kill
+    (when (:generator kill-pkg)
+      (gen/clients
+        (gen/time-limit settle-secs client-gen)))
+
+    ;; Phase 5: partition/clock faults + client ops
+    (when (:generator fault-pkg)
+      (->> client-gen
+           (gen/nemesis (:generator fault-pkg))
+           (gen/time-limit fault-secs)))
+
+    ;; Phase 6: heal faults
+    (when (:final-generator fault-pkg)
+      (gen/nemesis (:final-generator fault-pkg)))
+
+    ;; Phase 7: settle with writes (normal operation after heal)
     (gen/clients
       (gen/time-limit settle-secs client-gen))
 
-    ;; Phase 5: quiet convergence — no writes, let anti-entropy sync
-    (gen/sleep settle-secs)
+    ;; Phase 8: brief quiet window for anti-entropy
+    (gen/sleep 5)
 
-    ;; Phase 6: final reads
+    ;; Phase 9: final reads
     (when final-gen
       (gen/clients final-gen))))
 
-;; ---- Pre-built nemesis configurations ----
+;; ---- Pre-built nemesis configuration ----
 
 (defn safe-nemesis
-  "Nemesis package for safe-mode testing. Includes:
-    - Region-based partitions (tests light-cone behavior)
-    - Node kill/restart (tests effects log recovery)
-    - Clock skew (tests HLC absorption)"
-  [db]
-  (nemesis-package
-    {:db        db
-     :faults    #{:partition :kill :clock}
-     :partition {:targets [:region :majority]}
-     :kill      {:targets [:one :minority]}
-     :clock     {:targets [:one]}}))
+  "Nemesis package for Phase 1 single-region safe-mode testing.
 
-(defn holographic-nemesis
-  "Nemesis package for holographic-mode testing. Includes:
-    - All partition types including island and asymmetric
-    - Node kill/restart and pause/resume
-    - Clock skew
-    - Packet delay (stresses horizon wait)"
+  Includes:
+    - Single-node kill/restart during normal phase (tests crash recovery)
+    - Majority/minority partitions during fault phase (tests reachability-based write rules)
+    - Clock skew during fault phase (tests HLC absorption)
+
+  Constraints:
+    - Kill happens ONLY before partitions — killing a partitioned cache
+      node causes expected data loss (it's a cache, not a database).
+    - Kill targets :one only — design.md forbids rebooting the entire
+      cluster while partitioned."
   [db]
-  (nemesis-package
-    {:db        db
-     :faults    #{:partition :kill :pause :clock :packet}
-     :partition {:targets [:region :island :asymmetric :majority :majorities-ring]}
-     :kill      {:targets [:one :minority]}
-     :pause     {:targets [:one]}
-     :clock     {:targets [:one :minority]}
-     :packet    {:targets   [:one :minority]
-                 :behaviors [{:delay {}}]}}))
+  {:kill-pkg (nemesis-package
+               {:db     db
+                :faults #{:kill}
+                :kill   {:targets [:one]}})
+   :fault-pkg (nemesis-package
+                {:db        db
+                 :faults    #{:partition :clock}
+                 :partition {:targets [:one :majority]}
+                 :clock     {:targets [:one]}})})

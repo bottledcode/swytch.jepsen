@@ -25,13 +25,14 @@
    :sorted-set sorted-set/workload})
 
 (def nemesis-configs
-  "Map of nemesis configuration names to constructor functions."
-  {:none        (fn [_] {:nemesis         nemesis/noop
-                         :generator       nil
-                         :final-generator nil
-                         :perf            #{}})
-   :safe        (fn [db] (sn/safe-nemesis db))
-   :holographic (fn [db] (sn/holographic-nemesis db))})
+  "Map of nemesis configuration names to constructor functions.
+  Phase 1: only :none and :safe are available (single-region, no Cloud)."
+  {:none        (fn [_] {:kill-pkg  nil
+                         :fault-pkg {:nemesis         nemesis/noop
+                                     :generator       nil
+                                     :final-generator nil
+                                     :perf            #{}}})
+   :safe        (fn [db] (sn/safe-nemesis db))})
 
 (defn swytch-test
   "Constructs a Jepsen test map for Swytch."
@@ -53,7 +54,22 @@
         _               (when-not nemesis-fn
                           (throw (ex-info (str "Unknown nemesis config: " nemesis-name)
                                          {:available (keys nemesis-configs)})))
-        nemesis-pkg     (nemesis-fn db)]
+        nemesis-pkg     (nemesis-fn db)
+        ;; safe-nemesis returns {:kill-pkg ... :fault-pkg ...}
+        ;; :none returns a simple package — wrap it for compatibility
+        kill-pkg        (:kill-pkg nemesis-pkg)
+        fault-pkg       (:fault-pkg nemesis-pkg)
+        ;; Compose nemeses from both packages into one.
+        ;; nemesis/noop doesn't support Reflection (fs), so guard against that.
+        fs-or-empty (fn [nem] (try (nemesis/fs nem) (catch Exception _ #{})))
+        combined-nemesis (nemesis/compose
+                           (merge {}
+                             (when kill-pkg
+                               (into {} (map (fn [f] [f (:nemesis kill-pkg)])
+                                             (fs-or-empty (:nemesis kill-pkg)))))
+                             (when fault-pkg
+                               (into {} (map (fn [f] [f (:nemesis fault-pkg)])
+                                             (fs-or-empty (:nemesis fault-pkg)))))))]
     (merge tests/noop-test
            opts
            {:name           (str "swytch-" (name workload-name))
@@ -65,7 +81,7 @@
             :built?         built?
             :test-opts      test-opts
             :client         (swytch-client/client)
-            :nemesis        (:nemesis nemesis-pkg)
+            :nemesis        combined-nemesis
             :checker        (checker/compose
                               (merge
                                 {:timeline             (timeline/html)
@@ -80,7 +96,7 @@
                               nemesis-pkg
                               (:generator workload)
                               (:final-generator workload))
-            :perf           (:perf nemesis-pkg)})))
+            :perf           (into #{} (concat (:perf kill-pkg) (:perf fault-pkg)))})))
 
 ;; ---- CLI ----
 
@@ -94,7 +110,7 @@
     :default nil]
    [nil "--workload NAME" "Workload to run: counter, set, sorted-set"
     :default "counter"]
-   [nil "--nemesis-config NAME" "Nemesis config: none, safe, holographic"
+   [nil "--nemesis-config NAME" "Nemesis config: none, safe"
     :default "safe"]
    [nil "--rate NUM" "Ops per second"
     :default 100

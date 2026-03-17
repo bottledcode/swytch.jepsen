@@ -1,12 +1,16 @@
 (ns jepsen.swytch.checker
-  "Custom Jepsen checkers for Swytch consistency properties."
+  "Custom Jepsen checkers for Swytch consistency properties.
+
+  Phase 1: single-region safe mode. Validates:
+    - Convergence: all nodes agree after heal + settle
+    - CRDT counter correctness: sum of INCRs = final value
+    - Availability: commutative ops mostly succeed during partitions
+    - Partition effectiveness: both sides mutated independently
+    - Fork-choice: deterministic resolution after heal
+    - Safe transactions: exactly-once commit
+    - Partition blocks txns: transactions error during partitions"
   (:require [clojure.tools.logging :refer [info warn]]
-            [clojure.set :as set]
-            [jepsen [checker :as checker]
-                    [store :as store]
-                    [util :as util]]
-            [elle.list-append :as ela]
-            [elle.rw-register :as erw]))
+            [jepsen [checker :as checker]]))
 
 ;; ---- Helpers ----
 
@@ -149,7 +153,11 @@
 (defn availability-checker
   "During partition windows, the :fail rate for commutative operations
   (reads, writes, incr) must be below the given threshold (0.0 - 1.0).
-  Default threshold is 0.5 (50%)."
+  Default threshold is 0.5 (50%).
+
+  In single-region safe mode, minority-side nodes will error on writes
+  but majority-side nodes will succeed. With a 5-node cluster and a
+  3/2 split, ~40% of ops failing is expected."
   ([] (availability-checker 0.5))
   ([threshold]
    (reify checker/Checker
@@ -246,9 +254,10 @@
 ;; ---- Fork-Choice Checker ----
 
 (defn fork-choice-checker
-  "After a one-sided partition heals, all nodes must agree on the
-  same value. This is checked via final reads — after heal + settle,
-  every node should see the same value for each key."
+  "After a partition heals, all nodes must agree on the same value.
+  This validates deterministic fork-choice resolution: when both sides
+  of a partition performed commutative operations, the merge must
+  produce identical results on every node."
   []
   (reify checker/Checker
     (check [_ test history _opts]
@@ -268,78 +277,10 @@
         {:valid?        (empty? disagreements)
          :disagreements disagreements}))))
 
-;; ---- Hologram Cut Checker (stub) ----
-
-(defn hologram-cut-checker
-  "Checks that when both sides of a partition commit transactions,
-  the conflict is detected after heal and both histories are preserved.
-
-  NOTE: This is a stub — Swytch's API does not yet expose conflict
-  state. Currently only verifies that both partitions performed writes
-  during the split. Conflict detection will be added when the API
-  is available."
-  []
-  (reify checker/Checker
-    (check [_ test history _opts]
-      (let [windows (partition-windows history)
-            ok-ops  (with-nodes test (oks history))
-            partition-writes (->> ok-ops
-                                  (filter #(#{:write :txn} (:f %)))
-                                  (filter #(during-partition? windows %)))
-            nodes-that-wrote (set (map :node partition-writes))
-            both-sides?      (> (count nodes-that-wrote) 1)]
-        {:valid?           :unknown
-         :both-sides-wrote both-sides?
-         :writing-nodes    nodes-that-wrote
-         :note             "Stub: conflict detection requires Swytch API support"}))))
-
-;; ---- Per-Partition Elle Checker ----
-
-(defn per-partition-elle-checker
-  "Splits history by partition membership and runs Elle independently
-  on each sub-history. During connected periods, runs on the full
-  history. During partitions, runs on each partition group separately.
-
-  `elle-checker-fn` should be a function that takes opts and returns
-  an Elle checker (e.g. elle.list-append/check or elle.rw-register/check).
-
-  `opts` are passed through to Elle."
-  [elle-check-fn opts]
-  (reify checker/Checker
-    (check [_ test history checker-opts]
-      (let [all-maps (with-nodes test (all-ops history))
-            windows  (partition-windows history)
-            non-partition-ops (vec (remove #(during-partition? windows %) all-maps))
-            full-result (elle-check-fn
-                          (assoc opts :directory
-                                 (.getCanonicalPath
-                                   (store/path! test (:subdirectory checker-opts)
-                                                "elle" "full")))
-                          non-partition-ops)
-            partition-results
-            (when (seq windows)
-              (let [partition-ops (filter #(during-partition? windows %) all-maps)
-                    by-node (group-by :node partition-ops)]
-                (into {}
-                      (for [[node ops] by-node
-                            :when (seq ops)]
-                        [node
-                         (elle-check-fn
-                           (assoc opts :directory
-                                  (.getCanonicalPath
-                                    (store/path! test (:subdirectory checker-opts)
-                                                 "elle" (str "node-" node))))
-                           (vec ops))]))))]
-        {:valid?            (checker/merge-valid
-                              (cons (:valid? full-result)
-                                    (map :valid? (vals partition-results))))
-         :full              full-result
-         :per-partition     partition-results}))))
-
-;; ---- Composed checker for convenience ----
+;; ---- Composed checker for safe mode ----
 
 (defn safe-mode-checker
-  "Composes checkers appropriate for safe-mode testing."
+  "Composes checkers appropriate for Phase 1 single-region safe-mode testing."
   []
   (checker/compose
     {:convergence            (convergence-checker)
@@ -348,13 +289,3 @@
      :safe-txn               (safe-txn-checker)
      :partition-blocks-txns  (partition-blocks-txns-checker)
      :fork-choice            (fork-choice-checker)}))
-
-(defn holographic-mode-checker
-  "Composes checkers appropriate for holographic-mode testing."
-  []
-  (checker/compose
-    {:convergence    (convergence-checker)
-     :crdt-counter   (crdt-counter-checker)
-     :availability   (availability-checker 0.1)
-     :fork-choice    (fork-choice-checker)
-     :hologram-cut   (hologram-cut-checker)}))

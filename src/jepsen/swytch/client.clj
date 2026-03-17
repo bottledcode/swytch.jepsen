@@ -64,7 +64,7 @@
         :sadd    (let [v (car/wcar conn (apply car/sadd (str (:key op)) (:value op)))]
                    (if (instance? Exception v)
                      (assoc op :type :fail :error (.getMessage ^Exception v))
-                     (assoc op :type :ok :value v)))
+                     (assoc op :type :ok)))
         :smembers (let [v (car/wcar conn (car/smembers (str (:key op))))]
                     (if (instance? Exception v)
                       (assoc op :type :fail :error (.getMessage ^Exception v))
