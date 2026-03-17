@@ -34,8 +34,8 @@
   (let [cert-path (str "/etc/swytch/certs/" node "-cert.pem")
         key-path  (str "/etc/swytch/certs/" node "-key.pem")]
     (str/trim (c/exec "/opt/swytch/noise-keygen"
-                      "-cert" cert-path
-                      "-key"  key-path))))
+                      cert-path
+                      key-path))))
 
 (defn gen-cluster-config
   "Generates the cluster.yml content string for the given test.

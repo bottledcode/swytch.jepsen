@@ -171,7 +171,7 @@
   [{:keys [normal-secs fault-secs settle-secs]
     :or   {normal-secs 10
            fault-secs  30
-           settle-secs 10}}
+           settle-secs 30}}
    nemesis-pkg client-gen final-gen]
   (gen/phases
     ;; Phase 1: normal operation
@@ -186,11 +186,14 @@
     ;; Phase 3: heal
     (gen/nemesis (:final-generator nemesis-pkg))
 
-    ;; Phase 4: settle
+    ;; Phase 4: settle with writes (normal operation after heal)
     (gen/clients
       (gen/time-limit settle-secs client-gen))
 
-    ;; Phase 5: final reads
+    ;; Phase 5: quiet convergence — no writes, let anti-entropy sync
+    (gen/sleep settle-secs)
+
+    ;; Phase 6: final reads
     (when final-gen
       (gen/clients final-gen))))
 

@@ -9,47 +9,107 @@
                     [nemesis :as nemesis]
                     [tests :as tests]]
             [jepsen.checker.timeline :as timeline]
-            [jepsen.os.debian :as debian]
+            [jepsen.swytch.checker :as sc]
             [jepsen.swytch.client :as swytch-client]
-            [jepsen.swytch.db :as sdb]))
+            [jepsen.swytch.db :as sdb]
+            [jepsen.swytch.nemesis :as sn]
+            [jepsen.swytch.os :as swytch-os]
+            [jepsen.swytch.workload.counter :as counter]
+            [jepsen.swytch.workload.set :as set-wl]
+            [jepsen.swytch.workload.sorted-set :as sorted-set]))
 
-;; ---- Operation generators ----
+(def workloads
+  "Map of workload names to constructor functions."
+  {:counter    counter/workload
+   :set        set-wl/workload
+   :sorted-set sorted-set/workload})
 
-(defn r [_ _] {:type :invoke, :f :read, :key "x", :value nil})
-(defn w [_ _] {:type :invoke, :f :write, :key "x", :value (rand-int 100)})
-
-;; ---- Test definition ----
+(def nemesis-configs
+  "Map of nemesis configuration names to constructor functions."
+  {:none        (fn [_] {:nemesis         nemesis/noop
+                         :generator       nil
+                         :final-generator nil
+                         :perf            #{}})
+   :safe        (fn [db] (sn/safe-nemesis db))
+   :holographic (fn [db] (sn/holographic-nemesis db))})
 
 (defn swytch-test
   "Constructs a Jepsen test map for Swytch."
   [opts]
-  (let [ca-material    (atom {})
-        noise-keys     (atom {})
-        cluster-config (atom nil)]
+  (let [ca-material     (atom {})
+        noise-keys      (atom {})
+        cluster-config  (atom nil)
+        built?          (atom false)
+        test-opts       (atom nil)
+        db              (sdb/db opts)
+        workload-name   (keyword (:workload opts "counter"))
+        workload-fn     (get workloads workload-name)
+        _               (when-not workload-fn
+                          (throw (ex-info (str "Unknown workload: " workload-name)
+                                         {:available (keys workloads)})))
+        workload        (workload-fn opts)
+        nemesis-name    (keyword (:nemesis-config opts "safe"))
+        nemesis-fn      (get nemesis-configs nemesis-name)
+        _               (when-not nemesis-fn
+                          (throw (ex-info (str "Unknown nemesis config: " nemesis-name)
+                                         {:available (keys nemesis-configs)})))
+        nemesis-pkg     (nemesis-fn db)]
     (merge tests/noop-test
            opts
-           {:name           "swytch"
-            :os             debian/os
-            :db             (sdb/db opts)
+           {:name           (str "swytch-" (name workload-name))
+            :os             swytch-os/os
+            :db             db
             :ca-material    ca-material
             :noise-keys     noise-keys
             :cluster-config cluster-config
+            :built?         built?
+            :test-opts      test-opts
             :client         (swytch-client/client)
-            :nemesis        nemesis/noop
+            :nemesis        (:nemesis nemesis-pkg)
             :checker        (checker/compose
-                              {:timeline (timeline/html)})
-            :generator      (->> (gen/mix [r w])
-                                 (gen/stagger 1)
-                                 (gen/time-limit (:time-limit opts 30)))})))
+                              (merge
+                                {:timeline             (timeline/html)
+                                 :workload             (:checker workload)
+                                 :availability         (sc/availability-checker)}
+                                (when (not= nemesis-name :none)
+                                  {:partition-effective (sc/partition-effective-checker)})))
+            :generator      (sn/phase-generator
+                              {:normal-secs (:normal-secs opts 10)
+                               :fault-secs  (:fault-secs opts 30)
+                               :settle-secs (:settle-secs opts 10)}
+                              nemesis-pkg
+                              (:generator workload)
+                              (:final-generator workload))
+            :perf           (:perf nemesis-pkg)})))
 
 ;; ---- CLI ----
 
 (def cli-opts
   "Additional CLI options for Swytch tests."
-  [[nil "--swytch-binary PATH" "Path to the Swytch binary"
-    :default "/home/withinboredom/code/cloxcache/swytch"]
-   [nil "--noise-keygen-binary PATH" "Path to the noise-keygen binary"
-    :default nil]])
+  [[nil "--swytch-source PATH" "Path to Swytch source directory (builds automatically)"
+    :default "/home/withinboredom/code/cloxcache"]
+   [nil "--swytch-binary PATH" "Path to a pre-built Swytch binary (skips build)"
+    :default nil]
+   [nil "--noise-keygen-binary PATH" "Path to a pre-built noise-keygen binary"
+    :default nil]
+   [nil "--workload NAME" "Workload to run: counter, set, sorted-set"
+    :default "counter"]
+   [nil "--nemesis-config NAME" "Nemesis config: none, safe, holographic"
+    :default "safe"]
+   [nil "--rate NUM" "Ops per second"
+    :default 100
+    :parse-fn #(Long/parseLong %)]
+   [nil "--normal-secs NUM" "Seconds of normal operation before faults"
+    :default 10
+    :parse-fn #(Long/parseLong %)]
+   [nil "--fault-secs NUM" "Seconds of fault injection"
+    :default 30
+    :parse-fn #(Long/parseLong %)]
+   [nil "--settle-secs NUM" "Seconds to settle after healing (needs time for anti-entropy)"
+    :default 30
+    :parse-fn #(Long/parseLong %)]
+   [nil "--debug" "Enable debug logging on Swytch nodes"
+    :default false]])
 
 (defn -main
   "CLI entry point."

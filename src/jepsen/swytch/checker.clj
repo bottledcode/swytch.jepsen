@@ -10,32 +10,58 @@
 
 ;; ---- Helpers ----
 
-(defn ok-ops
-  "Filters history to only :ok operations."
-  [history]
-  (filter #(= :ok (:type %)) history))
+(defn ->map
+  "Converts an op (possibly a Jepsen Op record) to a plain map."
+  [op]
+  (into {} op))
 
-(defn info-ops
-  "Filters history to :info operations (nemesis)."
+(defn all-ops
+  "Converts a Jepsen history to a vec of plain maps."
   [history]
-  (filter #(= :info (:type %)) history))
+  (mapv ->map history))
 
-(defn fail-ops
-  "Filters history to :fail operations."
+(defn oks
+  "Returns a vec of :ok op maps from history."
   [history]
-  (filter #(= :fail (:type %)) history))
+  (into [] (filter #(= :ok (:type %))) (map ->map history)))
+
+(defn infos
+  "Returns a vec of :info op maps from history."
+  [history]
+  (into [] (filter #(= :info (:type %))) (map ->map history)))
+
+(defn fails
+  "Returns a vec of :fail op maps from history."
+  [history]
+  (into [] (filter #(= :fail (:type %))) (map ->map history)))
 
 (defn ops-by-f
-  "Filters history to operations with the given :f value."
-  [history f]
-  (filter #(= f (:f %)) history))
+  "Filters a seq of op maps to those with the given :f value.
+  Arg order is f first for use with ->> threading."
+  [f ops]
+  (filter #(= f (:f %)) ops))
+
+(defn op-node
+  "Derives the node name for an operation from its :process field.
+  In Jepsen, process p maps to (nth nodes (mod p (count nodes)))."
+  [test op]
+  (let [nodes (:nodes test)
+        p     (:process op)]
+    (when (number? p)
+      (nth nodes (mod p (count nodes))))))
+
+(defn with-nodes
+  "Annotates each op with :node derived from :process."
+  [test ops]
+  (mapv #(assoc % :node (op-node test %)) ops))
 
 (defn partition-windows
   "Extracts time windows where partitions were active from the history.
   Returns a seq of {:start time :stop time} maps."
   [history]
-  (let [nemesis-ops (info-ops history)]
-    (loop [ops   nemesis-ops
+  (let [nemesis-ops (->> (infos history)
+                         (filter #(#{:start-partition :stop-partition} (:f %))))]
+    (loop [ops   (seq nemesis-ops)
            start nil
            windows []]
       (if-let [op (first ops)]
@@ -49,7 +75,6 @@
           :else
           (recur (rest ops) start windows))
         (if start
-          ;; Partition still active at end of test
           (conj windows {:start start :stop Long/MAX_VALUE})
           windows)))))
 
@@ -65,29 +90,28 @@
 
 (defn convergence-checker
   "After partition heals + settle window, reads from ALL nodes should
-  return the same value. Looks at :final-read operations (ops with
-  :final-read? true or the last read per key per node)."
-  []
-  (reify checker/Checker
-    (check [_ test history _opts]
-      (let [;; Find final reads — ops tagged :final-read? or just the last reads
-            final-reads (->> history
-                             ok-ops
-                             (ops-by-f :read)
-                             (group-by (juxt :node :key))
-                             (map (fn [[_ ops]] (last ops)))
-                             (remove nil?))
-            ;; Group by key, check that all nodes got the same value
-            by-key      (group-by :key final-reads)
-            divergent   (into {}
-                              (for [[k reads] by-key
-                                    :let [values (distinct (map :value reads))]
-                                    :when (> (count values) 1)]
-                                [k {:values values
-                                    :reads  (mapv #(select-keys % [:node :value :time])
-                                                  reads)}]))]
-        {:valid?    (empty? divergent)
-         :divergent divergent}))))
+  return the same value. Looks at the last read per key per node.
+
+  `read-fs` is the set of :f values that count as reads (default #{:read})."
+  ([] (convergence-checker #{:read}))
+  ([read-fs]
+   (reify checker/Checker
+     (check [_ test history _opts]
+       (let [final-reads (->> (with-nodes test (oks history))
+                              (filter #(read-fs (:f %)))
+                              (group-by (juxt :node :key))
+                              (map (fn [[_ ops]] (last ops)))
+                              (remove nil?))
+             by-key      (group-by :key final-reads)
+             divergent   (into {}
+                               (for [[k reads] by-key
+                                     :let [values (distinct (map :value reads))]
+                                     :when (> (count values) 1)]
+                                 [k {:values values
+                                     :reads  (mapv #(select-keys % [:node :value :time])
+                                                   reads)}]))]
+         {:valid?    (empty? divergent)
+          :divergent divergent})))))
 
 ;; ---- CRDT Counter Checker ----
 
@@ -97,21 +121,17 @@
   []
   (reify checker/Checker
     (check [_ test history _opts]
-      (let [;; Count successful increments per key
-            incr-counts (->> history
-                             ok-ops
+      (let [ok-ops      (with-nodes test (oks history))
+            incr-counts (->> ok-ops
                              (ops-by-f :incr)
                              (group-by :key)
                              (map (fn [[k ops]] [k (count ops)]))
                              (into {}))
-            ;; Get final reads per key per node
-            final-reads (->> history
-                             ok-ops
+            final-reads (->> ok-ops
                              (ops-by-f :read)
                              (group-by (juxt :node :key))
                              (map (fn [[_ ops]] (last ops)))
                              (remove nil?))
-            ;; Check each final read matches expected count
             errors (for [read final-reads
                          :let [expected (get incr-counts (:key read) 0)
                                actual   (:value read)]
@@ -136,8 +156,8 @@
      (check [_ test history _opts]
        (let [windows          (partition-windows history)
              commutative-fs   #{:read :write :incr :sadd :lpush :zadd}
-             ;; Ops during partitions
-             partition-ops    (->> history
+             all              (all-ops history)
+             partition-ops    (->> all
                                    (filter #(#{:ok :fail} (:type %)))
                                    (filter #(commutative-fs (:f %)))
                                    (filter #(during-partition? windows %)))
@@ -150,6 +170,32 @@
           :fail-rate  fail-rate
           :threshold  threshold})))))
 
+;; ---- Partition Effectiveness Checker ----
+
+(defn partition-effective-checker
+  "Verifies that the network partition actually caused independent
+  mutation on multiple nodes. During partition windows, successful
+  write-like operations should originate from at least 2 different
+  nodes, proving both sides were mutating state independently.
+
+  Default write-fs: #{:write :incr :sadd :lpush :zadd :txn}"
+  ([] (partition-effective-checker #{:write :incr :sadd :lpush :zadd :txn}))
+  ([write-fs]
+   (reify checker/Checker
+     (check [_ test history _opts]
+       (let [windows (partition-windows history)
+             partition-writes (->> (with-nodes test (oks history))
+                                   (filter #(write-fs (:f %)))
+                                   (filter #(during-partition? windows %)))
+             writing-nodes (set (map :node partition-writes))]
+         (if (empty? windows)
+           {:valid?             :unknown
+            :note               "No partition windows detected"}
+           {:valid?             (>= (count writing-nodes) 2)
+            :writing-nodes      writing-nodes
+            :writing-node-count (count writing-nodes)
+            :partition-writes   (count partition-writes)}))))))
+
 ;; ---- Safe Transaction Checker ----
 
 (defn safe-txn-checker
@@ -159,19 +205,17 @@
   []
   (reify checker/Checker
     (check [_ test history _opts]
-      (let [committed-txns (->> history
-                                ok-ops
-                                (ops-by-f :txn))
-            ;; Extract writes from committed transactions
+      (let [committed-txns (->> (oks history)
+                                (ops-by-f :txn)
+                                vec)
             committed-writes (->> committed-txns
                                   (mapcat :value)
                                   (filter vector?)
                                   (filter #(= :write (first %)))
-                                  (group-by second)  ;; group by key
+                                  (group-by second)
                                   (map (fn [[k writes]]
                                          [k (mapv #(nth % 2) writes)]))
                                   (into {}))
-            ;; Check for duplicates
             duplicates (into {}
                              (for [[k values] committed-writes
                                    :let [dupes (filter #(> (val %) 1)
@@ -191,8 +235,7 @@
   (reify checker/Checker
     (check [_ test history _opts]
       (let [windows         (partition-windows history)
-            partition-txns  (->> history
-                                 ok-ops
+            partition-txns  (->> (oks history)
                                  (ops-by-f :txn)
                                  (filter #(during-partition? windows %))
                                  vec)]
@@ -207,12 +250,9 @@
   same value. This is checked via final reads — after heal + settle,
   every node should see the same value for each key."
   []
-  ;; This is functionally the same as convergence-checker but with
-  ;; a different semantic name for clarity in test output.
   (reify checker/Checker
     (check [_ test history _opts]
-      (let [final-reads (->> history
-                             ok-ops
+      (let [final-reads (->> (with-nodes test (oks history))
                              (ops-by-f :read)
                              (group-by (juxt :node :key))
                              (map (fn [[_ ops]] (last ops)))
@@ -242,18 +282,13 @@
   (reify checker/Checker
     (check [_ test history _opts]
       (let [windows (partition-windows history)
-            ;; Check if writes happened on both sides during partition
-            ;; (requires :node metadata on ops)
-            partition-writes (->> history
-                                  ok-ops
+            ok-ops  (with-nodes test (oks history))
+            partition-writes (->> ok-ops
                                   (filter #(#{:write :txn} (:f %)))
                                   (filter #(during-partition? windows %)))
             nodes-that-wrote (set (map :node partition-writes))
-            all-nodes        (set (:nodes test))
-            ;; Did writes happen on nodes in different partition groups?
-            ;; (This is a rough check — proper check needs partition membership)
             both-sides?      (> (count nodes-that-wrote) 1)]
-        {:valid?           :unknown  ;; Can't fully verify without conflict API
+        {:valid?           :unknown
          :both-sides-wrote both-sides?
          :writing-nodes    nodes-that-wrote
          :note             "Stub: conflict detection requires Swytch API support"}))))
@@ -272,23 +307,18 @@
   [elle-check-fn opts]
   (reify checker/Checker
     (check [_ test history checker-opts]
-      (let [windows    (partition-windows history)
-            dir        (store/path! test (:subdirectory checker-opts) "elle")
-            ;; Ops outside partitions — full cluster consistency
-            non-partition-ops (remove #(during-partition? windows %) history)
-            ;; Run Elle on non-partition history
+      (let [all-maps (with-nodes test (all-ops history))
+            windows  (partition-windows history)
+            non-partition-ops (vec (remove #(during-partition? windows %) all-maps))
             full-result (elle-check-fn
                           (assoc opts :directory
                                  (.getCanonicalPath
                                    (store/path! test (:subdirectory checker-opts)
                                                 "elle" "full")))
-                          (vec non-partition-ops))
-            ;; During partitions, split by node and run Elle per group
-            ;; For now, group by node since we don't have partition membership info
+                          non-partition-ops)
             partition-results
             (when (seq windows)
-              (let [partition-ops (->> history
-                                       (filter #(during-partition? windows %)))
+              (let [partition-ops (filter #(during-partition? windows %) all-maps)
                     by-node (group-by :node partition-ops)]
                 (into {}
                       (for [[node ops] by-node
@@ -325,6 +355,6 @@
   (checker/compose
     {:convergence    (convergence-checker)
      :crdt-counter   (crdt-counter-checker)
-     :availability   (availability-checker 0.1) ;; Stricter: AP mode should be highly available
+     :availability   (availability-checker 0.1)
      :fork-choice    (fork-choice-checker)
      :hologram-cut   (hologram-cut-checker)}))
