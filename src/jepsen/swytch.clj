@@ -15,14 +15,16 @@
             [jepsen.swytch.nemesis :as sn]
             [jepsen.swytch.os :as swytch-os]
             [jepsen.swytch.workload.counter :as counter]
+            [jepsen.swytch.workload.elle-causal :as elle-causal]
             [jepsen.swytch.workload.set :as set-wl]
             [jepsen.swytch.workload.sorted-set :as sorted-set]))
 
 (def workloads
   "Map of workload names to constructor functions."
-  {:counter    counter/workload
-   :set        set-wl/workload
-   :sorted-set sorted-set/workload})
+  {:counter      counter/workload
+   :set          set-wl/workload
+   :sorted-set   sorted-set/workload
+   :elle-causal  elle-causal/workload})
 
 (def nemesis-configs
   "Map of nemesis configuration names to constructor functions.
@@ -60,16 +62,16 @@
         kill-pkg        (:kill-pkg nemesis-pkg)
         fault-pkg       (:fault-pkg nemesis-pkg)
         ;; Compose nemeses from both packages into one.
+        ;; nemesis/compose with a map expects set keys: {#{:f1 :f2} nemesis}
         ;; nemesis/noop doesn't support Reflection (fs), so guard against that.
-        fs-or-empty (fn [nem] (try (nemesis/fs nem) (catch AbstractMethodError _ #{})))
+        fs-or-empty (fn [nem] (if nem (try (nemesis/fs nem) (catch AbstractMethodError _ #{})) #{}))
         combined-nemesis (nemesis/compose
-                           (merge {}
-                             (when kill-pkg
-                               (into {} (map (fn [f] [f (:nemesis kill-pkg)])
-                                             (fs-or-empty (:nemesis kill-pkg)))))
-                             (when fault-pkg
-                               (into {} (map (fn [f] [f (:nemesis fault-pkg)])
-                                             (fs-or-empty (:nemesis fault-pkg)))))))]
+                           (into {}
+                             (keep identity
+                               [(when-let [fs (not-empty (fs-or-empty (:nemesis kill-pkg)))]
+                                  [fs (:nemesis kill-pkg)])
+                                (when-let [fs (not-empty (fs-or-empty (:nemesis fault-pkg)))]
+                                  [fs (:nemesis fault-pkg)])])))]
     (merge tests/noop-test
            opts
            {:name           (str "swytch-" (name workload-name))
@@ -80,7 +82,7 @@
             :cluster-config cluster-config
             :built?         built?
             :test-opts      test-opts
-            :client         (swytch-client/client)
+            :client         (or (:client workload) (swytch-client/client))
             :nemesis        combined-nemesis
             :checker        (checker/compose
                               (merge
@@ -108,7 +110,7 @@
     :default nil]
    [nil "--noise-keygen-binary PATH" "Path to a pre-built noise-keygen binary"
     :default nil]
-   [nil "--workload NAME" "Workload to run: counter, set, sorted-set"
+   [nil "--workload NAME" "Workload to run: counter, set, sorted-set, elle-causal"
     :default "counter"]
    [nil "--nemesis-config NAME" "Nemesis config: none, safe"
     :default "safe"]

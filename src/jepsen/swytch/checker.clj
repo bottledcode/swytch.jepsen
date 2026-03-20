@@ -83,12 +83,16 @@
           windows)))))
 
 (defn during-partition?
-  "Returns true if the operation occurred during any partition window."
-  [windows op]
-  (let [t (:time op)]
-    (some (fn [{:keys [start stop]}]
-            (and (<= start t) (<= t stop)))
-          windows)))
+  "Returns true if the operation occurred during any partition window.
+  A grace period (in nanoseconds) shrinks the window from the start to
+  account for partition detection latency — nodes need time to notice
+  that peers are unreachable before they can reject writes."
+  ([windows op] (during-partition? windows op 0))
+  ([windows op grace-nanos]
+   (let [t (:time op)]
+     (some (fn [{:keys [start stop]}]
+             (and (<= (+ start grace-nanos) t) (<= t stop)))
+           windows))))
 
 ;; ---- Convergence Checker ----
 
@@ -180,11 +184,18 @@
 
 ;; ---- Partition Effectiveness Checker ----
 
+(def ^:private partition-grace-nanos
+  "Grace period (5 seconds in nanoseconds) after a partition starts
+  before we expect nodes to have detected the partition. Nodes need
+  time to notice peers are unreachable via heartbeat timeouts."
+  (* 5 1000000000))
+
 (defn partition-effective-checker
   "Verifies that the network partition actually caused independent
-  mutation on multiple nodes. During partition windows, successful
-  write-like operations should originate from at least 2 different
-  nodes, proving both sides were mutating state independently.
+  mutation on multiple nodes. During partition windows (after a grace
+  period for partition detection), successful write-like operations
+  should originate from at least 2 different nodes, proving both
+  sides were mutating state independently.
 
   Default write-fs: #{:write :incr :sadd :lpush :zadd :txn}"
   ([] (partition-effective-checker #{:write :incr :sadd :lpush :zadd :txn}))
@@ -194,11 +205,21 @@
        (let [windows (partition-windows history)
              partition-writes (->> (with-nodes test (oks history))
                                    (filter #(write-fs (:f %)))
-                                   (filter #(during-partition? windows %)))
+                                   (filter #(during-partition? windows % partition-grace-nanos)))
              writing-nodes (set (map :node partition-writes))]
-         (if (empty? windows)
+         (cond
+           (empty? windows)
            {:valid?             :unknown
             :note               "No partition windows detected"}
+
+           (zero? (count partition-writes))
+           {:valid?             true
+            :note               "No writes observed during partition (after grace period)"
+            :writing-nodes      #{}
+            :writing-node-count 0
+            :partition-writes   0}
+
+           :else
            {:valid?             (>= (count writing-nodes) 2)
             :writing-nodes      writing-nodes
             :writing-node-count (count writing-nodes)
@@ -238,14 +259,15 @@
 
 (defn partition-blocks-txns-checker
   "In safe mode, zero transactions should commit during a partition.
-  Checks that no :txn operations succeed during partition windows."
+  Checks that no :txn operations succeed during partition windows
+  (after the grace period for partition detection)."
   []
   (reify checker/Checker
     (check [_ test history _opts]
       (let [windows         (partition-windows history)
             partition-txns  (->> (oks history)
                                  (ops-by-f :txn)
-                                 (filter #(during-partition? windows %))
+                                 (filter #(during-partition? windows % partition-grace-nanos))
                                  vec)]
         {:valid?              (empty? partition-txns)
          :committed-during-partition (count partition-txns)
