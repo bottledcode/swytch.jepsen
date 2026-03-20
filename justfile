@@ -9,12 +9,14 @@ _run workload nemesis *extra_args:
 safe-counter *args: (_run "counter" "safe" args)
 safe-set *args: (_run "set" "safe" args)
 safe-sorted-set *args: (_run "sorted-set" "safe" args)
+safe-elle-causal *args: (_run "elle-causal" "safe" args)
 
 # No nemesis
 none-counter *args: (_run "counter" "none" args)
 none-set *args: (_run "set" "none" args)
 none-sorted-set *args: (_run "sorted-set" "none" args)
+none-elle-causal *args: (_run "elle-causal" "none" args)
 
 # Run all workloads with a given nemesis
-safe-all: safe-counter safe-set safe-sorted-set
-none-all: none-counter none-set none-sorted-set
+safe-all: safe-counter safe-set safe-sorted-set safe-elle-causal
+none-all: none-counter none-set none-sorted-set none-elle-causal

@@ -96,7 +96,13 @@
         (n/teardown! p test)))))
 
 (defn swytch-partition-package
-  "Like Jepsen's partition-package but includes Swytch-specific partition types."
+  "Like Jepsen's partition-package but includes Swytch-specific partition types.
+  Returns nil nemesis when partitions are not in the fault set, so that
+  compose-packages doesn't route partition :f values to this package.
+
+  Partitions are held open for at least 10 seconds so that nodes have
+  time to detect the partition and the checker can observe writes on
+  both sides."
   [opts]
   (let [needed?  ((:faults opts) :partition)
         targets  (:targets (:partition opts)
@@ -105,15 +111,17 @@
                             :f :start-partition
                             :value (rand/nth targets)})
         stop     {:type :info :f :stop-partition :value nil}
-        gen      (->> (gen/flip-flop start (gen/repeat stop))
-                      (gen/stagger (:interval opts nc/default-interval)))]
+        gen      (gen/cycle-times
+                   10 start
+                   5  stop)]
     {:generator       (when needed? gen)
      :final-generator (when needed? stop)
-     :nemesis         (swytch-partition-nemesis (:db opts))
-     :perf            #{{:name  "partition"
-                         :start #{:start-partition}
-                         :stop  #{:stop-partition}
-                         :color "#E9DCA0"}}}))
+     :nemesis         (when needed? (swytch-partition-nemesis (:db opts)))
+     :perf            (when needed?
+                        #{{:name  "partition"
+                           :start #{:start-partition}
+                           :stop  #{:stop-partition}
+                           :color "#E9DCA0"}})}))
 
 ;; ---- Composed nemesis packages ----
 
