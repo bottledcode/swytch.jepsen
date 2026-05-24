@@ -211,7 +211,7 @@
                        "--cluster-port"        (str cluster-port)])
         base-args   (cond-> base-args
                       join-dns     (into ["--join" join-dns])
-                      (:debug test) (into ["-v"]))]
+                      (:debug test) (into [(if (= subcommand "sql") "-v" "--debug")]))]
     (info "Starting Swytch" subcommand "on" node
           "port" port "cluster-port" cluster-port
           "join" join-dns)
